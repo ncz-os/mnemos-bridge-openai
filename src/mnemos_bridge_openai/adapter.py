@@ -51,7 +51,16 @@ class MnemosOpenAIAdapter:
             )
 
         auth = _build_auth_resolver(mcp_token)
-        client = await _maybe_await(_call_from_url(McpClient.from_url, mcp_url, mcp_token, auth, timeout))
+        # Prefer the v0.1.2+ open_from_url that opens the SSE session in one call;
+        # fall back to from_url + __aenter__ when running against older core builds.
+        opener = getattr(McpClient, "open_from_url", None)
+        if opener is not None:
+            client = await opener(mcp_url, token=mcp_token, timeout=timeout)
+        else:
+            client = await _maybe_await(_call_from_url(McpClient.from_url, mcp_url, mcp_token, auth, timeout))
+            aenter = getattr(client, "__aenter__", None)
+            if aenter is not None:
+                await aenter()
         return cls(client)
 
     async def openai_tools(self) -> list[dict[str, Any]]:
@@ -142,12 +151,15 @@ class MnemosOpenAIAdapter:
 
         try:
             return await _maybe_await(to_openai(mcp_tools))
-        except TypeError as exc:
+        except (TypeError, AttributeError) as exc:
+            # Core SchemaTranslator.to_openai() takes a single ToolSchema, not a
+            # list. When that signature is in play, iterate per-tool. Older
+            # batch-shaped translators continue to work via the try-branch above.
             per_tool: list[Any] = []
             for tool in mcp_tools:
                 try:
                     per_tool.append(await _maybe_await(to_openai(tool)))
-                except TypeError:
+                except (TypeError, AttributeError):
                     raise exc from None
             return per_tool
 
@@ -326,7 +338,11 @@ async def _maybe_await(value: Any) -> Any:
 
 
 def _ensure_sequence(value: Any) -> list[Any]:
-    value = _to_plain(value)
+    # NOTE: do NOT call _to_plain on the WHOLE value — pydantic ToolSchema
+    # items must reach SchemaTranslator.to_openai() with their attributes
+    # intact, not pre-dumped to plain dicts. We only unwrap container
+    # shapes ({"tools":[...]}, etc.) here; per-item normalization is
+    # done at the consumer (e.g., _normalize_openai_tool).
     if value is None:
         return []
     if isinstance(value, list):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -117,8 +118,6 @@ async def test_post_dispatch_type_error_does_not_retry_tool_call() -> None:
 
 @pytest.mark.asyncio
 async def test_handle_tool_call_stream_emits_valid_openai_chunk_with_completion_metadata() -> None:
-    from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
-
     client = FakeMcpClient()
     adapter = MnemosOpenAIAdapter(client, dispatcher=False, result_renderer=FakeResultRenderer())
     tool_call = FakeToolCall(
@@ -154,22 +153,32 @@ async def test_handle_tool_call_stream_emits_valid_openai_chunk_with_completion_
             }
         ],
     }
-    parsed = ChatCompletionChunk.model_validate(chunks[0])
-    assert parsed.id == "chatcmpl_123"
-    assert parsed.choices[0].finish_reason == "stop"
 
 
 @pytest.mark.asyncio
 async def test_handle_tool_call_stream_supplies_required_metadata_defaults() -> None:
-    from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
-
     client = FakeMcpClient()
     adapter = MnemosOpenAIAdapter(client, dispatcher=False, result_renderer=FakeResultRenderer())
     tool_call = FakeToolCall(id="call_123", function=FakeFunction(name="search_memories", arguments="{}"))
 
     chunks = [chunk async for chunk in adapter.handle_tool_call_stream(tool_call)]
 
-    parsed = ChatCompletionChunk.model_validate(chunks[0])
-    assert parsed.id.startswith("chatcmpl-mnemos-")
-    assert parsed.created > 0
-    assert parsed.model == "mnemos-tool-result"
+    chunk = chunks[0]
+    completion_id = chunk["id"]
+    assert completion_id.startswith("chatcmpl-mnemos-")
+    assert uuid.UUID(hex=completion_id.removeprefix("chatcmpl-mnemos-"))
+    assert isinstance(chunk["created"], int)
+    assert chunk["created"] > 0
+    assert chunk["model"] == "mnemos-tool-result"
+    assert chunk["object"] == "chat.completion.chunk"
+    assert chunk["choices"] == [
+        {
+            "index": 0,
+            "delta": {
+                "role": "tool",
+                "tool_call_id": "call_123",
+                "content": "known MNEMOS result",
+            },
+            "finish_reason": "stop",
+        }
+    ]

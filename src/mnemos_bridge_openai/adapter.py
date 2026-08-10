@@ -170,23 +170,31 @@ class MnemosOpenAIAdapter:
                 if dispatch is None:
                     continue
 
-                for args in ((name, arguments), (tool_call,), (name,), ({"name": name, "arguments": arguments},)):
-                    try:
-                        return await _maybe_await(dispatch(*args))
-                    except TypeError:
-                        continue
+                candidates = (
+                    (
+                        (name, arguments),
+                        (self._mcp_client, name, arguments),
+                        (tool_call,),
+                        (name,),
+                        ({"name": name, "arguments": arguments},),
+                    )
+                    if method_name == "dispatch"
+                    else ((name, arguments), (tool_call,), (name,), ({"name": name, "arguments": arguments},))
+                )
+                args = _bind_supported_args(dispatch, candidates)
+                if args is not None:
+                    return await _maybe_await(dispatch(*args))
 
         call_tool = getattr(self._mcp_client, "call_tool", None)
         if call_tool is None:
             raise AttributeError("Neither Dispatcher nor McpClient exposes a supported tool dispatch method.")
 
-        for args in ((name, arguments), (name,), ({"name": name, "arguments": arguments},)):
-            try:
-                return await _maybe_await(call_tool(*args))
-            except TypeError:
-                continue
-
-        raise TypeError("McpClient.call_tool() exists but did not accept any supported argument shape.")
+        args = _bind_supported_args(
+            call_tool, ((name, arguments), (name,), ({"name": name, "arguments": arguments},))
+        )
+        if args is None:
+            raise TypeError("McpClient.call_tool() exists but did not accept any supported argument shape.")
+        return await _maybe_await(call_tool(*args))
 
     async def _render_result(self, result: Any, tool_call_id: str) -> Any:
         if self._result_renderer is None:
@@ -335,6 +343,28 @@ async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+def _bind_supported_args(
+    function: Callable[..., Any], candidates: tuple[tuple[Any, ...], ...]
+) -> tuple[Any, ...] | None:
+    """Select a supported call shape without invoking a potentially mutating operation."""
+
+    try:
+        signature = inspect.signature(function)
+    except (TypeError, ValueError):
+        # Some extension callables do not expose a signature. Select the canonical
+        # shape so the caller still invokes the operation exactly once.
+        return candidates[0]
+
+    for args in candidates:
+        try:
+            signature.bind(*args)
+        except TypeError:
+            continue
+        return args
+
+    return None
 
 
 def _ensure_sequence(value: Any) -> list[Any]:

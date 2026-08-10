@@ -41,6 +41,21 @@ and returns a tool message:
 {"role": "tool", "tool_call_id": "...", "content": "..."}
 ```
 
+`handle_tool_call_stream()` emits that completed result as one SDK-valid
+`ChatCompletionChunk`. It accepts optional `completion_id`, `created`, and
+`model` keyword arguments for correlation with a surrounding completion and
+generates valid standalone defaults when they are omitted:
+
+```python
+async for chunk in adapter.handle_tool_call_stream(
+    tool_call,
+    completion_id=response.id,
+    created=response.created,
+    model=response.model,
+):
+    consume(chunk)
+```
+
 `await adapter.aclose()` closes the MCP client. The adapter also works as an async context manager.
 
 ## Stateless One-Turn Example
@@ -144,8 +159,8 @@ Tokens are never hardcoded.
 
 ## What Does Not Work Yet
 
-`handle_tool_call_stream()` currently emits a single completed tool-result chunk. True incremental streaming is planned
-for v0.2 once MNEMOS core exposes streaming dispatcher events.
+`handle_tool_call_stream()` emits a single completed, SDK-valid tool-result chunk rather than incremental result
+events. True incremental streaming is planned for v0.2 once MNEMOS core exposes streaming dispatcher events.
 
 
 ## Build infrastructure & partners

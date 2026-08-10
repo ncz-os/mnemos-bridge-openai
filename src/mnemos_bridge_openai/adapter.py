@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import inspect
 import json
+import time
+import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -87,8 +89,19 @@ class MnemosOpenAIAdapter:
         rendered = await self._render_result(result, tool_call_id)
         return _normalize_tool_message(rendered, tool_call_id)
 
-    async def handle_tool_call_stream(self, tool_call: Any) -> AsyncIterator[dict[str, Any]]:
-        """Yield one streaming-compatible chunk for a completed MNEMOS tool result.
+    async def handle_tool_call_stream(
+        self,
+        tool_call: Any,
+        *,
+        completion_id: str | None = None,
+        created: int | None = None,
+        model: str = "mnemos-tool-result",
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Yield one valid Chat Completions chunk for a completed MNEMOS tool result.
+
+        ``completion_id``, ``created``, and ``model`` let a caller associate the
+        synthetic result chunk with its surrounding completion. Defaults keep the
+        original one-argument API working when that metadata is unavailable.
 
         TODO(v0.2): replace this compatibility shim with true incremental streaming once
         the MNEMOS core dispatcher exposes streaming result events.
@@ -96,11 +109,15 @@ class MnemosOpenAIAdapter:
 
         message = await self.handle_tool_call(tool_call)
         yield {
+            "id": completion_id or f"chatcmpl-mnemos-{uuid.uuid4().hex}",
+            "created": int(time.time()) if created is None else created,
+            "model": model,
+            "object": "chat.completion.chunk",
             "choices": [
                 {
                     "index": 0,
                     "delta": message,
-                    "finish_reason": None,
+                    "finish_reason": "stop",
                 }
             ]
         }

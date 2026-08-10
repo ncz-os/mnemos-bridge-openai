@@ -113,3 +113,63 @@ async def test_post_dispatch_type_error_does_not_retry_tool_call() -> None:
 
     assert dispatcher.calls == [("create_memory", {"content": "important"})]
     assert client.calls == [("create_memory", {"content": "important"})]
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_call_stream_emits_valid_openai_chunk_with_completion_metadata() -> None:
+    from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
+
+    client = FakeMcpClient()
+    adapter = MnemosOpenAIAdapter(client, dispatcher=False, result_renderer=FakeResultRenderer())
+    tool_call = FakeToolCall(
+        id="call_123",
+        function=FakeFunction(name="search_memories", arguments='{"query": "infrastructure"}'),
+    )
+
+    chunks = [
+        chunk
+        async for chunk in adapter.handle_tool_call_stream(
+            tool_call,
+            completion_id="chatcmpl_123",
+            created=1_723_456_789,
+            model="gpt-4o",
+        )
+    ]
+
+    assert len(chunks) == 1
+    assert chunks[0] == {
+        "id": "chatcmpl_123",
+        "created": 1_723_456_789,
+        "model": "gpt-4o",
+        "object": "chat.completion.chunk",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {
+                    "role": "tool",
+                    "tool_call_id": "call_123",
+                    "content": "known MNEMOS result",
+                },
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    parsed = ChatCompletionChunk.model_validate(chunks[0])
+    assert parsed.id == "chatcmpl_123"
+    assert parsed.choices[0].finish_reason == "stop"
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_call_stream_supplies_required_metadata_defaults() -> None:
+    from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
+
+    client = FakeMcpClient()
+    adapter = MnemosOpenAIAdapter(client, dispatcher=False, result_renderer=FakeResultRenderer())
+    tool_call = FakeToolCall(id="call_123", function=FakeFunction(name="search_memories", arguments="{}"))
+
+    chunks = [chunk async for chunk in adapter.handle_tool_call_stream(tool_call)]
+
+    parsed = ChatCompletionChunk.model_validate(chunks[0])
+    assert parsed.id.startswith("chatcmpl-mnemos-")
+    assert parsed.created > 0
+    assert parsed.model == "mnemos-tool-result"

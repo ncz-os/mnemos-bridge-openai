@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -25,6 +24,7 @@ class FakeToolCall:
 @dataclass
 class FakeToolResult:
     content: str
+    is_error: bool = False
 
 
 class FakeMcpClient:
@@ -59,6 +59,31 @@ class PostDispatchTypeError:
         self.calls.append((name, arguments))
         await self.client.call_tool(name, arguments)
         raise TypeError("response decoding failed after dispatch")
+
+
+class AmbiguousFailureClient:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> FakeToolResult:
+        self.calls += 1
+        raise TimeoutError("response was lost after dispatch")
+
+
+class RetryConfigurableDispatcher:
+    def __init__(self, *, retries: int = 2) -> None:
+        self.retries = retries
+
+    async def dispatch(
+        self, client: AmbiguousFailureClient, name: str, arguments: dict[str, Any]
+    ) -> FakeToolResult:
+        for attempt in range(self.retries + 1):
+            try:
+                return await client.call_tool(name, arguments)
+            except TimeoutError:
+                if attempt == self.retries:
+                    raise
+        raise AssertionError("unreachable")
 
 
 @pytest.mark.asyncio
@@ -117,7 +142,45 @@ async def test_post_dispatch_type_error_does_not_retry_tool_call() -> None:
 
 
 @pytest.mark.asyncio
-async def test_handle_tool_call_stream_emits_valid_openai_chunk_with_completion_metadata() -> None:
+async def test_default_dispatcher_disables_ambiguous_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(adapter_module, "Dispatcher", RetryConfigurableDispatcher)
+    client = AmbiguousFailureClient()
+    adapter = MnemosOpenAIAdapter(client, result_renderer=FakeResultRenderer())
+    tool_call = FakeToolCall(
+        id="call_123",
+        function=FakeFunction(name="create_memory", arguments='{"content": "important"}'),
+    )
+
+    with pytest.raises(TimeoutError, match="response was lost after dispatch"):
+        await adapter.handle_tool_call(tool_call)
+
+    assert client.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_call_preserves_mcp_error_state_as_json() -> None:
+    class ErrorClient(FakeMcpClient):
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> FakeToolResult:
+            self.calls.append((name, arguments))
+            return FakeToolResult(content="permission denied", is_error=True)
+
+    adapter = MnemosOpenAIAdapter(ErrorClient(), dispatcher=False, result_renderer=FakeResultRenderer())
+    tool_call = FakeToolCall(
+        id="call_123",
+        function=FakeFunction(name="delete_memory", arguments='{"memory_id": "mem_123"}'),
+    )
+
+    message = await adapter.handle_tool_call(tool_call)
+
+    assert message == {
+        "role": "tool",
+        "tool_call_id": "call_123",
+        "content": '{"error":"permission denied","is_error":true}',
+    }
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_call_stream_emits_custom_event_with_tool_message() -> None:
     client = FakeMcpClient()
     adapter = MnemosOpenAIAdapter(client, dispatcher=False, result_renderer=FakeResultRenderer())
     tool_call = FakeToolCall(
@@ -137,48 +200,30 @@ async def test_handle_tool_call_stream_emits_valid_openai_chunk_with_completion_
 
     assert len(chunks) == 1
     assert chunks[0] == {
-        "id": "chatcmpl_123",
-        "created": 1_723_456_789,
-        "model": "gpt-4o",
-        "object": "chat.completion.chunk",
-        "choices": [
-            {
-                "index": 0,
-                "delta": {
-                    "role": "tool",
-                    "tool_call_id": "call_123",
-                    "content": "known MNEMOS result",
-                },
-                "finish_reason": "stop",
-            }
-        ],
+        "type": "mnemos.tool_result",
+        "message": {
+            "role": "tool",
+            "tool_call_id": "call_123",
+            "content": "known MNEMOS result",
+        },
     }
 
 
 @pytest.mark.asyncio
-async def test_handle_tool_call_stream_supplies_required_metadata_defaults() -> None:
+async def test_handle_tool_call_stream_default_call_returns_next_turn_message() -> None:
     client = FakeMcpClient()
     adapter = MnemosOpenAIAdapter(client, dispatcher=False, result_renderer=FakeResultRenderer())
     tool_call = FakeToolCall(id="call_123", function=FakeFunction(name="search_memories", arguments="{}"))
 
     chunks = [chunk async for chunk in adapter.handle_tool_call_stream(tool_call)]
 
-    chunk = chunks[0]
-    completion_id = chunk["id"]
-    assert completion_id.startswith("chatcmpl-mnemos-")
-    assert uuid.UUID(hex=completion_id.removeprefix("chatcmpl-mnemos-"))
-    assert isinstance(chunk["created"], int)
-    assert chunk["created"] > 0
-    assert chunk["model"] == "mnemos-tool-result"
-    assert chunk["object"] == "chat.completion.chunk"
-    assert chunk["choices"] == [
+    assert chunks == [
         {
-            "index": 0,
-            "delta": {
+            "type": "mnemos.tool_result",
+            "message": {
                 "role": "tool",
                 "tool_call_id": "call_123",
                 "content": "known MNEMOS result",
             },
-            "finish_reason": "stop",
         }
     ]

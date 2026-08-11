@@ -34,7 +34,7 @@ dev = [
 ]
 
 [tool.uv.sources]
-mnemos-bridge-core = { git = "https://gitlab.com/mnemos-os/mnemos-bridge-core" }
+mnemos-bridge-core = { git = "https://gitlab.com/ncz-os/mnemos-bridge-core.git" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mnemos_bridge_openai"]

@@ -18,7 +18,7 @@ uv sync --extra dev
 ```
 
 The `pyproject.toml` includes a `tool.uv.sources` entry that points `mnemos-bridge-core` at
-`git+https://gitlab.com/mnemos-os/mnemos-bridge-core`.
+`git+https://gitlab.com/ncz-os/mnemos-bridge-core.git`.
 
 ## API
 
@@ -41,19 +41,16 @@ and returns a tool message:
 {"role": "tool", "tool_call_id": "...", "content": "..."}
 ```
 
-`handle_tool_call_stream()` emits that completed result as one SDK-valid
-`ChatCompletionChunk`. It accepts optional `completion_id`, `created`, and
-`model` keyword arguments for correlation with a surrounding completion and
-generates valid standalone defaults when they are omitted:
+`handle_tool_call_stream()` emits one adapter-specific event containing the completed
+tool message. It is not a `ChatCompletionChunk`; append the event's `message` to the
+next Chat Completions request. The optional `completion_id`, `created`, and `model`
+arguments remain accepted for compatibility but are ignored:
 
 ```python
-async for chunk in adapter.handle_tool_call_stream(
+async for event in adapter.handle_tool_call_stream(
     tool_call,
-    completion_id=response.id,
-    created=response.created,
-    model=response.model,
 ):
-    consume(chunk)
+    messages.append(event["message"])
 ```
 
 `await adapter.aclose()` closes the MCP client. The adapter also works as an async context manager.
@@ -150,7 +147,7 @@ Live integration tests are skipped unless all required environment variables are
 
 ```bash
 export OPENAI_API_KEY=...
-export MNEMOS_TEST_BASE=http://192.168.207.67:5003
+export MNEMOS_TEST_BASE=http://192.168.207.67:5003/sse
 export MNEMOS_MCP_TOKEN=...
 pytest tests/integration
 ```
@@ -159,8 +156,8 @@ Tokens are never hardcoded.
 
 ## What Does Not Work Yet
 
-`handle_tool_call_stream()` emits a single completed, SDK-valid tool-result chunk rather than incremental result
-events. True incremental streaming is planned for v0.2 once MNEMOS core exposes streaming dispatcher events.
+`handle_tool_call_stream()` emits a single `mnemos.tool_result` adapter event rather than a Chat Completions stream.
+True incremental result events are planned for v0.2 once MNEMOS core exposes streaming dispatcher events.
 
 
 ## Build infrastructure & partners

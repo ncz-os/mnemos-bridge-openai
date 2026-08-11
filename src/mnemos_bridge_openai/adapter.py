@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import inspect
 import json
-import time
-import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -87,7 +85,14 @@ class MnemosOpenAIAdapter:
         arguments = _parse_arguments(_shape_get(function, "arguments", default={}))
         result = await self._dispatch_tool(name, arguments, tool_call)
         rendered = await self._render_result(result, tool_call_id)
-        return _normalize_tool_message(rendered, tool_call_id)
+        message = _normalize_tool_message(rendered, tool_call_id)
+        if bool(_shape_get(result, "is_error", default=False)):
+            message["content"] = json.dumps(
+                {"error": message["content"], "is_error": True},
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
+        return message
 
     async def handle_tool_call_stream(
         self,
@@ -97,11 +102,12 @@ class MnemosOpenAIAdapter:
         created: int | None = None,
         model: str = "mnemos-tool-result",
     ) -> AsyncIterator[dict[str, Any]]:
-        """Yield one valid Chat Completions chunk for a completed MNEMOS tool result.
+        """Yield one MNEMOS event containing a completed OpenAI tool message.
 
-        ``completion_id``, ``created``, and ``model`` let a caller associate the
-        synthetic result chunk with its surrounding completion. Defaults keep the
-        original one-argument API working when that metadata is unavailable.
+        The event is adapter output, not a ``ChatCompletionChunk``. Append its
+        ``message`` to the next Chat Completions request. The metadata arguments
+        are retained for call compatibility but are not used because a client-side
+        tool result does not belong to the preceding model completion.
 
         TODO(v0.2): replace this compatibility shim with true incremental streaming once
         the MNEMOS core dispatcher exposes streaming result events.
@@ -109,17 +115,8 @@ class MnemosOpenAIAdapter:
 
         message = await self.handle_tool_call(tool_call)
         yield {
-            "id": completion_id or f"chatcmpl-mnemos-{uuid.uuid4().hex}",
-            "created": int(time.time()) if created is None else created,
-            "model": model,
-            "object": "chat.completion.chunk",
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": message,
-                    "finish_reason": "stop",
-                }
-            ]
+            "type": "mnemos.tool_result",
+            "message": message,
         }
 
     async def aclose(self) -> None:
@@ -327,10 +324,10 @@ def _make_dispatcher(mcp_client: Any) -> Any | None:
         return None
 
     for args, kwargs in (
-        ((mcp_client,), {}),
-        ((), {"client": mcp_client}),
-        ((), {"mcp_client": mcp_client}),
-        ((), {}),
+        ((mcp_client,), {"retries": 0}),
+        ((), {"client": mcp_client, "retries": 0}),
+        ((), {"mcp_client": mcp_client, "retries": 0}),
+        ((), {"retries": 0}),
     ):
         try:
             return Dispatcher(*args, **kwargs)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -12,7 +13,9 @@ if TYPE_CHECKING:
 
 try:  # pragma: no cover - exercised by integration tests when the core package is installed.
     from mnemos_bridge_core import AuthResolver, Dispatcher, McpClient, ResultRenderer, SchemaTranslator
-except ImportError:  # pragma: no cover - offline tests monkeypatch these names.
+except ModuleNotFoundError as exc:  # pragma: no cover - offline tests monkeypatch these names.
+    if exc.name != "mnemos_bridge_core":
+        raise
     AuthResolver = None  # type: ignore[assignment]
     Dispatcher = None  # type: ignore[assignment]
     McpClient = None  # type: ignore[assignment]
@@ -32,6 +35,8 @@ class MnemosOpenAIAdapter:
         result_renderer: Any | None = None,
     ) -> None:
         self._mcp_client = mcp_client
+        self._connection_owner_task: asyncio.Task[None] | None = None
+        self._connection_owner_requests: asyncio.Queue[Any] | None = None
         self._dispatcher = dispatcher if dispatcher is not None else _make_dispatcher(mcp_client)
         self._schema_translator = (
             schema_translator if schema_translator is not None else _make_service(SchemaTranslator, mcp_client)
@@ -50,18 +55,26 @@ class MnemosOpenAIAdapter:
                 "Install this package with its runtime dependencies first."
             )
 
-        auth = _build_auth_resolver(mcp_token)
-        # Prefer the v0.1.2+ open_from_url that opens the SSE session in one call;
-        # fall back to from_url + __aenter__ when running against older core builds.
-        opener = getattr(McpClient, "open_from_url", None)
-        if opener is not None:
-            client = await opener(mcp_url, token=mcp_token, timeout=timeout)
-        else:
-            client = await _maybe_await(_call_from_url(McpClient.from_url, mcp_url, mcp_token, auth, timeout))
-            aenter = getattr(client, "__aenter__", None)
-            if aenter is not None:
-                await aenter()
-        return cls(client)
+        started: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        requests: asyncio.Queue[Any] = asyncio.Queue()
+        owner_task = asyncio.create_task(
+            _own_mcp_connection(mcp_url, mcp_token, timeout, started, requests)
+        )
+        try:
+            await started
+        except BaseException:
+            if not owner_task.done():
+                owner_task.cancel()
+            try:
+                await owner_task
+            except asyncio.CancelledError:
+                pass
+            raise
+
+        adapter = cls(_OwnedMcpClient(requests))
+        adapter._connection_owner_task = owner_task
+        adapter._connection_owner_requests = requests
+        return adapter
 
     async def openai_tools(self) -> list[dict[str, Any]]:
         """Return OpenAI Chat Completions function-tool definitions for MNEMOS tools."""
@@ -122,14 +135,16 @@ class MnemosOpenAIAdapter:
     async def aclose(self) -> None:
         """Close the underlying MCP client if it exposes an async or sync close hook."""
 
-        close = getattr(self._mcp_client, "aclose", None) or getattr(self._mcp_client, "close", None)
-        if close is not None:
-            await _maybe_await(close())
+        owner_task = self._connection_owner_task
+        if owner_task is not None:
+            assert self._connection_owner_requests is not None
+            await self._connection_owner_requests.put(None)
+            await owner_task
+            self._connection_owner_task = None
+            self._connection_owner_requests = None
             return
 
-        exit_method = getattr(self._mcp_client, "__aexit__", None)
-        if exit_method is not None:
-            await _maybe_await(exit_method(None, None, None))
+        await _close_mcp_client(self._mcp_client)
 
     async def __aenter__(self) -> MnemosOpenAIAdapter:
         return self
@@ -225,6 +240,80 @@ class MnemosOpenAIAdapter:
                 continue
 
         raise TypeError("ResultRenderer.to_openai_message() did not accept the result.")
+
+
+async def _own_mcp_connection(
+    mcp_url: str,
+    mcp_token: str,
+    timeout: float,
+    started: asyncio.Future[None],
+    requests: asyncio.Queue[Any],
+) -> None:
+    """Run all task-affine MCP transport work from one owner task."""
+
+    client: Any | None = None
+    try:
+        assert McpClient is not None
+        auth = _build_auth_resolver(mcp_token)
+        client = await _maybe_await(_call_from_url(McpClient.from_url, mcp_url, mcp_token, auth, timeout))
+        aenter = getattr(client, "__aenter__", None)
+        if aenter is not None:
+            await _maybe_await(aenter())
+        if started.cancelled():
+            return
+        started.set_result(None)
+        while True:
+            request = await requests.get()
+            if request is None:
+                break
+            method_name, args, kwargs, result = request
+            if result.cancelled():
+                continue
+            try:
+                value = await _maybe_await(getattr(client, method_name)(*args, **kwargs))
+            except BaseException as error:
+                if not result.done():
+                    result.set_exception(error)
+            else:
+                if not result.done():
+                    result.set_result(value)
+    except BaseException as error:
+        if not started.done():
+            started.set_exception(error)
+            return
+        raise
+    finally:
+        if client is not None:
+            await _close_mcp_client(client)
+
+
+class _OwnedMcpClient:
+    """Proxy MCP operations to the task that owns the transport contexts."""
+
+    def __init__(self, requests: asyncio.Queue[Any]) -> None:
+        self._requests = requests
+
+    async def list_tools(self) -> Any:
+        return await self._call("list_tools")
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        return await self._call("call_tool", name, arguments)
+
+    async def _call(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        result: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        await self._requests.put((method_name, args, kwargs, result))
+        return await result
+
+
+async def _close_mcp_client(client: Any) -> None:
+    close = getattr(client, "aclose", None) or getattr(client, "close", None)
+    if close is not None:
+        await _maybe_await(close())
+        return
+
+    exit_method = getattr(client, "__aexit__", None)
+    if exit_method is not None:
+        await _maybe_await(exit_method(None, None, None))
 
 
 def _call_from_url(from_url: Callable[..., Any], mcp_url: str, mcp_token: str, auth: Any | None, timeout: float) -> Any:

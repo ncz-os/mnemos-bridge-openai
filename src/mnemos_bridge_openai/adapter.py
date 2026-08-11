@@ -86,7 +86,7 @@ class MnemosOpenAIAdapter:
         result = await self._dispatch_tool(name, arguments, tool_call)
         rendered = await self._render_result(result, tool_call_id)
         message = _normalize_tool_message(rendered, tool_call_id)
-        if bool(_shape_get(result, "is_error", default=False)):
+        if _result_reports_error(result):
             message["content"] = json.dumps(
                 {"error": message["content"], "is_error": True},
                 ensure_ascii=True,
@@ -473,6 +473,27 @@ def _shape_get(value: Any, key: str, *, default: Any = None) -> Any:
     if isinstance(value, Mapping):
         return value.get(key, default)
     return getattr(value, key, default)
+
+
+def _result_reports_error(result: Any) -> bool:
+    """Recognize both MCP error flags and MNEMOS JSON failure envelopes."""
+
+    if bool(_shape_get(result, "is_error", default=False)) or bool(_shape_get(result, "isError", default=False)):
+        return True
+
+    content = _shape_get(result, "content")
+    items = content if isinstance(content, (list, tuple)) else [content]
+    for item in items:
+        text = item if isinstance(item, str) else _shape_get(item, "text")
+        if not isinstance(text, str):
+            continue
+        try:
+            payload = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(payload, Mapping) and (payload.get("success") is False or "error" in payload):
+            return True
+    return False
 
 
 def _normalize_tool_message(rendered: Any, tool_call_id: str) -> dict[str, str]:

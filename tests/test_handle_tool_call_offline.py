@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,6 +28,18 @@ class FakeToolResult:
     is_error: bool = False
 
 
+@dataclass
+class FakeTextContent:
+    type: str
+    text: str
+
+
+@dataclass
+class FakeStructuredToolResult:
+    content: list[FakeTextContent]
+    is_error: bool = False
+
+
 class FakeMcpClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
@@ -39,6 +52,11 @@ class FakeMcpClient:
 class FakeResultRenderer:
     def to_openai_message(self, result: FakeToolResult) -> str:
         return result.content
+
+
+class FakeStructuredResultRenderer:
+    def to_openai_message(self, result: FakeStructuredToolResult) -> str:
+        return " ".join(block.text for block in result.content if block.text)
 
 
 class CoreDispatcher:
@@ -177,6 +195,63 @@ async def test_handle_tool_call_preserves_mcp_error_state_as_json() -> None:
         "tool_call_id": "call_123",
         "content": '{"error":"permission denied","is_error":true}',
     }
+
+
+@pytest.mark.parametrize(
+    "producer_payload",
+    [
+        '{"success": false, "error": "backend unavailable"}',
+        '{"error": "503 Service Unavailable", "detail": {"retry": true}}',
+    ],
+)
+@pytest.mark.asyncio
+async def test_handle_tool_call_recognizes_mnemos_json_failure_envelope(producer_payload: str) -> None:
+    class ProducerShapedClient(FakeMcpClient):
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> FakeStructuredToolResult:
+            self.calls.append((name, arguments))
+            return FakeStructuredToolResult(
+                content=[FakeTextContent(type="text", text=producer_payload)],
+                is_error=False,
+            )
+
+    adapter = MnemosOpenAIAdapter(
+        ProducerShapedClient(),
+        dispatcher=False,
+        result_renderer=FakeStructuredResultRenderer(),
+    )
+    tool_call = FakeToolCall(
+        id="call_123",
+        function=FakeFunction(name="create_memory", arguments="{}"),
+    )
+
+    message = await adapter.handle_tool_call(tool_call)
+
+    marked_error = json.loads(message["content"])
+    assert marked_error["is_error"] is True
+    assert json.loads(marked_error["error"]) == json.loads(producer_payload)
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_call_does_not_mark_success_with_nested_error_field() -> None:
+    producer_payload = '{"success": true, "result": {"error": "historical value"}}'
+
+    class ProducerShapedClient(FakeMcpClient):
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> FakeStructuredToolResult:
+            return FakeStructuredToolResult(
+                content=[FakeTextContent(type="text", text=producer_payload)],
+                is_error=False,
+            )
+
+    adapter = MnemosOpenAIAdapter(
+        ProducerShapedClient(),
+        dispatcher=False,
+        result_renderer=FakeStructuredResultRenderer(),
+    )
+    tool_call = FakeToolCall(id="call_123", function=FakeFunction(name="search_memories", arguments="{}"))
+
+    message = await adapter.handle_tool_call(tool_call)
+
+    assert message["content"] == producer_payload
 
 
 @pytest.mark.asyncio

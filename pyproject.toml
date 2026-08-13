@@ -4,14 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mnemos-bridge-openai"
-version = "0.1.1"
+version = "0.1.2"
 description = "OpenAI Python SDK adapter for the MNEMOS bridge abstraction."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 authors = [{ name = "MNEMOS OS" }]
 dependencies = [
-    "mnemos-bridge-core>=0.1.1",
+    "mnemos-bridge-core>=0.1.4",
     "mcp>=1.27,<2",
     "openai>=1.50",
     "httpx>=0.27",

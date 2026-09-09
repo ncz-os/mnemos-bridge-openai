@@ -41,6 +41,10 @@ and returns a tool message:
 {"role": "tool", "tool_call_id": "...", "content": "..."}
 ```
 
+Tool dispatch is fail-closed until `openai_tools()` successfully discovers the tools. Code that constructs an adapter
+around an existing MCP client may instead pass `allowed_tools=[...]` to `MnemosOpenAIAdapter(...)` when it needs an
+explicit allowlist before discovery.
+
 `handle_tool_call_stream()` emits one adapter-specific event containing the completed
 tool message. It is not a `ChatCompletionChunk`; append the event's `message` to the
 next Chat Completions request. The optional `completion_id`, `created`, and `model`

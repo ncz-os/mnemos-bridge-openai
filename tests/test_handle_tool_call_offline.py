@@ -92,9 +92,7 @@ class RetryConfigurableDispatcher:
     def __init__(self, *, retries: int = 2) -> None:
         self.retries = retries
 
-    async def dispatch(
-        self, client: AmbiguousFailureClient, name: str, arguments: dict[str, Any]
-    ) -> FakeToolResult:
+    async def dispatch(self, client: AmbiguousFailureClient, name: str, arguments: dict[str, Any]) -> FakeToolResult:
         for attempt in range(self.retries + 1):
             try:
                 return await client.call_tool(name, arguments)
@@ -110,7 +108,7 @@ async def test_handle_tool_call_dispatches_and_returns_tool_message(monkeypatch:
     monkeypatch.setattr(adapter_module, "ResultRenderer", FakeResultRenderer)
 
     client = FakeMcpClient()
-    adapter = MnemosOpenAIAdapter(client)
+    adapter = MnemosOpenAIAdapter(client, allowed_tools=["search_memories"])
     tool_call = FakeToolCall(
         id="call_123",
         function=FakeFunction(name="search_memories", arguments='{"query": "infrastructure"}'),
@@ -130,7 +128,12 @@ async def test_handle_tool_call_dispatches_and_returns_tool_message(monkeypatch:
 async def test_handle_tool_call_uses_core_dispatcher_signature() -> None:
     client = FakeMcpClient()
     dispatcher = CoreDispatcher()
-    adapter = MnemosOpenAIAdapter(client, dispatcher=dispatcher, result_renderer=FakeResultRenderer())
+    adapter = MnemosOpenAIAdapter(
+        client,
+        dispatcher=dispatcher,
+        result_renderer=FakeResultRenderer(),
+        allowed_tools=["search_memories"],
+    )
     tool_call = FakeToolCall(
         id="call_123",
         function=FakeFunction(name="search_memories", arguments='{"query": "infrastructure"}'),
@@ -146,7 +149,12 @@ async def test_handle_tool_call_uses_core_dispatcher_signature() -> None:
 async def test_post_dispatch_type_error_does_not_retry_tool_call() -> None:
     client = FakeMcpClient()
     dispatcher = PostDispatchTypeError(client)
-    adapter = MnemosOpenAIAdapter(client, dispatcher=dispatcher, result_renderer=FakeResultRenderer())
+    adapter = MnemosOpenAIAdapter(
+        client,
+        dispatcher=dispatcher,
+        result_renderer=FakeResultRenderer(),
+        allowed_tools=["create_memory"],
+    )
     tool_call = FakeToolCall(
         id="call_123",
         function=FakeFunction(name="create_memory", arguments='{"content": "important"}'),
@@ -163,7 +171,11 @@ async def test_post_dispatch_type_error_does_not_retry_tool_call() -> None:
 async def test_default_dispatcher_disables_ambiguous_retries(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(adapter_module, "Dispatcher", RetryConfigurableDispatcher)
     client = AmbiguousFailureClient()
-    adapter = MnemosOpenAIAdapter(client, result_renderer=FakeResultRenderer())
+    adapter = MnemosOpenAIAdapter(
+        client,
+        result_renderer=FakeResultRenderer(),
+        allowed_tools=["create_memory"],
+    )
     tool_call = FakeToolCall(
         id="call_123",
         function=FakeFunction(name="create_memory", arguments='{"content": "important"}'),
@@ -182,7 +194,12 @@ async def test_handle_tool_call_preserves_mcp_error_state_as_json() -> None:
             self.calls.append((name, arguments))
             return FakeToolResult(content="permission denied", is_error=True)
 
-    adapter = MnemosOpenAIAdapter(ErrorClient(), dispatcher=False, result_renderer=FakeResultRenderer())
+    adapter = MnemosOpenAIAdapter(
+        ErrorClient(),
+        dispatcher=False,
+        result_renderer=FakeResultRenderer(),
+        allowed_tools=["delete_memory"],
+    )
     tool_call = FakeToolCall(
         id="call_123",
         function=FakeFunction(name="delete_memory", arguments='{"memory_id": "mem_123"}'),
@@ -218,6 +235,7 @@ async def test_handle_tool_call_recognizes_mnemos_json_failure_envelope(producer
         ProducerShapedClient(),
         dispatcher=False,
         result_renderer=FakeStructuredResultRenderer(),
+        allowed_tools=["create_memory"],
     )
     tool_call = FakeToolCall(
         id="call_123",
@@ -246,6 +264,7 @@ async def test_handle_tool_call_does_not_mark_success_with_nested_error_field() 
         ProducerShapedClient(),
         dispatcher=False,
         result_renderer=FakeStructuredResultRenderer(),
+        allowed_tools=["search_memories"],
     )
     tool_call = FakeToolCall(id="call_123", function=FakeFunction(name="search_memories", arguments="{}"))
 
@@ -257,7 +276,12 @@ async def test_handle_tool_call_does_not_mark_success_with_nested_error_field() 
 @pytest.mark.asyncio
 async def test_handle_tool_call_stream_emits_custom_event_with_tool_message() -> None:
     client = FakeMcpClient()
-    adapter = MnemosOpenAIAdapter(client, dispatcher=False, result_renderer=FakeResultRenderer())
+    adapter = MnemosOpenAIAdapter(
+        client,
+        dispatcher=False,
+        result_renderer=FakeResultRenderer(),
+        allowed_tools=["search_memories"],
+    )
     tool_call = FakeToolCall(
         id="call_123",
         function=FakeFunction(name="search_memories", arguments='{"query": "infrastructure"}'),
@@ -287,7 +311,12 @@ async def test_handle_tool_call_stream_emits_custom_event_with_tool_message() ->
 @pytest.mark.asyncio
 async def test_handle_tool_call_stream_default_call_returns_next_turn_message() -> None:
     client = FakeMcpClient()
-    adapter = MnemosOpenAIAdapter(client, dispatcher=False, result_renderer=FakeResultRenderer())
+    adapter = MnemosOpenAIAdapter(
+        client,
+        dispatcher=False,
+        result_renderer=FakeResultRenderer(),
+        allowed_tools=["search_memories"],
+    )
     tool_call = FakeToolCall(id="call_123", function=FakeFunction(name="search_memories", arguments="{}"))
 
     chunks = [chunk async for chunk in adapter.handle_tool_call_stream(tool_call)]

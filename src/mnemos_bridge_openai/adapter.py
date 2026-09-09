@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -33,10 +33,16 @@ class MnemosOpenAIAdapter:
         dispatcher: Any | None = None,
         schema_translator: Any | None = None,
         result_renderer: Any | None = None,
+        allowed_tools: Iterable[str] | None = None,
     ) -> None:
         self._mcp_client = mcp_client
         self._connection_owner_task: asyncio.Task[None] | None = None
         self._connection_owner_requests: asyncio.Queue[Any] | None = None
+        self._allowed_tools = frozenset(map(str, allowed_tools)) if allowed_tools is not None else None
+        self._offered_tools: frozenset[str] | None = None
+        self._tool_discovery_generation = 0
+        self._tool_discoveries_in_progress = 0
+        self._pending_offered_tools: tuple[int, frozenset[str]] | None = None
         self._dispatcher = dispatcher if dispatcher is not None else _make_dispatcher(mcp_client)
         self._schema_translator = (
             schema_translator if schema_translator is not None else _make_service(SchemaTranslator, mcp_client)
@@ -57,9 +63,7 @@ class MnemosOpenAIAdapter:
 
         started: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         requests: asyncio.Queue[Any] = asyncio.Queue()
-        owner_task = asyncio.create_task(
-            _own_mcp_connection(mcp_url, mcp_token, timeout, started, requests)
-        )
+        owner_task = asyncio.create_task(_own_mcp_connection(mcp_url, mcp_token, timeout, started, requests))
         try:
             await started
         except BaseException:
@@ -79,9 +83,30 @@ class MnemosOpenAIAdapter:
     async def openai_tools(self) -> list[dict[str, Any]]:
         """Return OpenAI Chat Completions function-tool definitions for MNEMOS tools."""
 
-        mcp_tools = await self._list_mcp_tools()
-        translated = await self._translate_tools(mcp_tools)
-        return [_normalize_openai_tool(tool) for tool in _ensure_sequence(translated)]
+        self._tool_discovery_generation += 1
+        generation = self._tool_discovery_generation
+        self._tool_discoveries_in_progress += 1
+        self._offered_tools = None
+        self._pending_offered_tools = None
+        try:
+            mcp_tools = await self._list_mcp_tools()
+            translated = await self._translate_tools(mcp_tools)
+            tools = [_normalize_openai_tool(tool) for tool in _ensure_sequence(translated)]
+            if generation == self._tool_discovery_generation:
+                offered = frozenset(tool["function"]["name"] for tool in tools)
+                self._pending_offered_tools = (generation, offered)
+            return tools
+        except BaseException:
+            if generation == self._tool_discovery_generation:
+                self._pending_offered_tools = None
+            raise
+        finally:
+            self._tool_discoveries_in_progress -= 1
+            if self._tool_discoveries_in_progress == 0:
+                pending = self._pending_offered_tools
+                if pending is not None and pending[0] == self._tool_discovery_generation:
+                    self._offered_tools = pending[1]
+                self._pending_offered_tools = None
 
     async def handle_tool_call(self, tool_call: Any) -> dict[str, str]:
         """Dispatch one OpenAI tool call to MNEMOS and return a Chat Completions tool message."""
@@ -94,6 +119,8 @@ class MnemosOpenAIAdapter:
         name = _shape_get(function, "name")
         if not name:
             raise ValueError("OpenAI tool_call is missing function.name.")
+        name = str(name)
+        self._check_tool_allowed(name)
 
         arguments = _parse_arguments(_shape_get(function, "arguments", default={}))
         result = await self._dispatch_tool(name, arguments, tool_call)
@@ -157,6 +184,18 @@ class MnemosOpenAIAdapter:
     ) -> None:
         await self.aclose()
 
+    def _check_tool_allowed(self, name: str) -> None:
+        """Reject calls until an explicit or discovered tool allowlist exists."""
+
+        allowed = self._allowed_tools if self._allowed_tools is not None else self._offered_tools
+        if allowed is None:
+            raise ValueError(
+                "Tool dispatch is disabled until openai_tools() completes discovery "
+                "or allowed_tools is configured explicitly."
+            )
+        if name not in allowed:
+            raise ValueError(f"Tool {name!r} is not in this adapter's allowed-tool set.")
+
     async def _list_mcp_tools(self) -> list[Any]:
         for name in ("list_tools", "tools", "get_tools", "list_available_tools"):
             candidate = getattr(self._mcp_client, name, None)
@@ -218,9 +257,7 @@ class MnemosOpenAIAdapter:
         if call_tool is None:
             raise AttributeError("Neither Dispatcher nor McpClient exposes a supported tool dispatch method.")
 
-        args = _bind_supported_args(
-            call_tool, ((name, arguments), (name,), ({"name": name, "arguments": arguments},))
-        )
+        args = _bind_supported_args(call_tool, ((name, arguments), (name,), ({"name": name, "arguments": arguments},)))
         if args is None:
             raise TypeError("McpClient.call_tool() exists but did not accept any supported argument shape.")
         return await _maybe_await(call_tool(*args))
@@ -318,63 +355,52 @@ async def _close_mcp_client(client: Any) -> None:
 
 def _call_from_url(from_url: Callable[..., Any], mcp_url: str, mcp_token: str, auth: Any | None, timeout: float) -> Any:
     candidates = _from_url_candidates(from_url, mcp_token, auth, timeout)
-    last_error: TypeError | None = None
+    try:
+        signature = inspect.signature(from_url)
+    except (TypeError, ValueError):
+        # Some extension callables do not expose a signature. Invoke the
+        # canonical credential-bearing shape once and propagate any error.
+        return from_url(mcp_url, **candidates[0])
 
     for kwargs in candidates:
         try:
-            return from_url(mcp_url, **kwargs)
-        except TypeError as exc:
-            last_error = exc
+            signature.bind(mcp_url, **kwargs)
+        except TypeError:
+            continue
+        return from_url(mcp_url, **kwargs)
 
-    if last_error is not None:
-        raise last_error
-    return from_url(mcp_url)
+    raise TypeError("McpClient.from_url() does not accept a supported credential-bearing argument shape.")
 
 
 def _from_url_candidates(
     from_url: Callable[..., Any], mcp_token: str, auth: Any | None, timeout: float
 ) -> list[dict[str, Any]]:
+    credentials: list[dict[str, Any]] = [
+        {"token": mcp_token},
+        {"bearer_token": mcp_token},
+        {"mcp_token": mcp_token},
+        {"headers": {"Authorization": f"Bearer {mcp_token}"}},
+    ]
+    if auth is not None:
+        credentials.extend(({"auth": auth}, {"auth_resolver": auth}))
+
     try:
         parameters = inspect.signature(from_url).parameters
     except (TypeError, ValueError):
         parameters = {}
+    else:
+        explicit = [credential for credential in credentials if next(iter(credential)) in parameters]
+        if explicit:
+            # Prefer the factory's declared credential parameter over a generic
+            # **kwargs sink that may accept but ignore a different shape.
+            credentials = explicit
+        elif any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+            credentials = credentials[:1]
 
-    kwargs: dict[str, Any] = {}
-    if "timeout" in parameters:
-        kwargs["timeout"] = timeout
-    if auth is not None and "auth" in parameters:
-        kwargs["auth"] = auth
-    elif auth is not None and "auth_resolver" in parameters:
-        kwargs["auth_resolver"] = auth
-    elif "token" in parameters:
-        kwargs["token"] = mcp_token
-    elif "bearer_token" in parameters:
-        kwargs["bearer_token"] = mcp_token
-    elif "mcp_token" in parameters:
-        kwargs["mcp_token"] = mcp_token
-    elif "headers" in parameters:
-        kwargs["headers"] = {"Authorization": f"Bearer {mcp_token}"}
-
-    ordered: list[dict[str, Any]] = []
-    if kwargs:
-        ordered.append(kwargs)
-    if auth is not None:
-        ordered.extend(
-            [
-                {"auth": auth, "timeout": timeout},
-                {"auth_resolver": auth, "timeout": timeout},
-            ]
-        )
-    ordered.extend(
-        [
-            {"token": mcp_token, "timeout": timeout},
-            {"bearer_token": mcp_token, "timeout": timeout},
-            {"mcp_token": mcp_token, "timeout": timeout},
-            {"headers": {"Authorization": f"Bearer {mcp_token}"}, "timeout": timeout},
-            {"timeout": timeout},
-            {},
-        ]
-    )
+    # Every candidate carries the credential. The no-timeout variants retain
+    # compatibility with legacy factories that do not accept a timeout keyword.
+    ordered = [dict(credential, timeout=timeout) for credential in credentials]
+    ordered.extend(credentials)
 
     deduped: list[dict[str, Any]] = []
     seen: set[tuple[tuple[str, str], ...]] = set()
